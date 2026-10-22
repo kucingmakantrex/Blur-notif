@@ -482,4 +482,75 @@ jobs:
               }
 
               public static void log(Throwable t) {
-                  throw 
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> hookClass, String methodName, XC_MethodHook callback) {
+                  throw new UnsupportedOperationException("stub");
+              }
+          }
+          __HUN_EOF__
+          mkdir -p xposed-api/src/main/java/de/robv/android/xposed
+          cat > xposed-api/src/main/java/de/robv/android/xposed/XposedHelpers.java <<'__HUN_EOF__'
+          package de.robv.android.xposed;
+
+          import java.lang.reflect.Field;
+
+          public final class XposedHelpers {
+              private XposedHelpers() {
+              }
+
+              public static Class<?> findClass(String className, ClassLoader classLoader) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Field findField(Class<?> clazz, String fieldName) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static XC_MethodHook.Unhook findAndHookMethod(Class<?> clazz, String methodName, Object... parameterTypesAndCallback) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Object callMethod(Object obj, String methodName, Object... args) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Object setAdditionalInstanceField(Object obj, String key, Object value) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Object getAdditionalInstanceField(Object obj, String key) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static Object removeAdditionalInstanceField(Object obj, String key) {
+                  throw new UnsupportedOperationException("stub");
+              }
+          }
+          __HUN_EOF__
+          mkdir -p xposed-api/src/main/java/de/robv/android/xposed/callbacks
+          cat > xposed-api/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java <<'__HUN_EOF__'
+          package de.robv.android.xposed.callbacks;
+
+          public abstract class XC_LoadPackage {
+              public static final class LoadPackageParam {
+                  public String packageName;
+                  public String processName;
+                  public ClassLoader classLoader;
+                  public boolean isFirstApplication;
+              }
+          }
+          __HUN_EOF__
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HiOS-HUN-Blur-APK
+          path: app/build/outputs/apk/debug/*.apk

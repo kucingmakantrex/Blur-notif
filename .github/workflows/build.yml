@@ -1,0 +1,485 @@
+# Satu file ini sudah berisi seluruh proyek modul. Cukup simpan sebagai
+# .github/workflows/build.yml lalu jalankan di tab Actions.
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Tulis file proyek
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'__HUN_EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.hioshunblur'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.hioshunblur'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              // API Xposed hanya dipakai saat kompilasi; saat berjalan disediakan oleh LSPosed.
+              compileOnly project(':xposed-api')
+          }
+          __HUN_EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__HUN_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name">
+
+                  <meta-data
+                      android:name="xposedmodule"
+                      android:value="true" />
+                  <meta-data
+                      android:name="xposeddescription"
+                      android:value="Efek blur kaca pada notifikasi heads-up (SystemUI HiOS)" />
+                  <meta-data
+                      android:name="xposedminversion"
+                      android:value="93" />
+                  <meta-data
+                      android:name="xposedscope"
+                      android:resource="@array/xposedscope" />
+              </application>
+          </manifest>
+          __HUN_EOF__
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/xposed_init <<'__HUN_EOF__'
+          com.hioshunblur.MainHook
+          __HUN_EOF__
+          mkdir -p app/src/main/java/com/hioshunblur
+          cat > app/src/main/java/com/hioshunblur/MainHook.java <<'__HUN_EOF__'
+          package com.hioshunblur;
+
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewParent;
+
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /**
+           * Memberi efek blur kaca pada kartu notifikasi heads-up (yang muncul di atas layar).
+           *
+           * Cara kerja: sebelum NotificationBackgroundView menggambar latarnya, kita gambar dulu
+           * BackgroundBlurDrawable milik jendela SystemUI (blur isi di belakang jendela), lalu
+           * latar kartu dibuat semi-transparan. Jika ada langkah yang gagal, kartu tetap tampil
+           * seperti aslinya.
+           */
+          public class MainHook implements IXposedHookLoadPackage {
+
+              private static final String SYSTEMUI = "com.android.systemui";
+              private static final String ROW_PKG = "com.android.systemui.statusbar.notification.row.";
+
+              // ---- Pengaturan tampilan (ubah lalu build ulang) ----
+              /** Kekuatan blur dalam piksel. Makin besar makin buram. */
+              private static final int BLUR_RADIUS = 90;
+              /** Opasitas warna kartu di atas blur, 0 (transparan) sampai 255 (solid). */
+              private static final int CARD_ALPHA = 160;
+              /** Radius sudut cadangan (dp) bila radius asli kartu tidak terbaca. */
+              private static final float FALLBACK_RADIUS_DP = 26f;
+              // ------------------------------------------------------
+
+              private static final String K_BLUR = "hunblur_drawable";
+              private static final String K_ROOT = "hunblur_root";
+              private static final String K_MOD = "hunblur_modified";
+
+              private static final ConcurrentHashMap<String, Field> FIELDS = new ConcurrentHashMap<>();
+
+              private static Class<?> sRowClass;
+              private static Class<?> sBgBaseClass;
+              private static boolean sLoggedError;
+
+              private static boolean sBlurApiResolved;
+              private static Object sBlurListeners;
+              private static Method sIsBlurEnabled;
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+                  if (!SYSTEMUI.equals(lpparam.packageName)) {
+                      return;
+                  }
+                  try {
+                      ClassLoader cl = lpparam.classLoader;
+                      sBgBaseClass = XposedHelpers.findClass(ROW_PKG + "NotificationBackgroundView", cl);
+                      sRowClass = XposedHelpers.findClass(ROW_PKG + "ExpandableNotificationRow", cl);
+
+                      // Hook onDraw pada kelas turunan Transsion bila punya onDraw sendiri,
+                      // supaya tidak tergambar dua kali.
+                      Class<?> drawTarget = sBgBaseClass;
+                      Class<?> trBg = XposedHelpers.findClassIfExists(ROW_PKG + "TrNotificationBackgroundView", cl);
+                      if (trBg != null && hasDeclaredOnDraw(trBg)) {
+                          drawTarget = trBg;
+                      }
+                      XposedHelpers.findAndHookMethod(drawTarget, "onDraw", Canvas.class, DRAW_HOOK);
+
+                      // Pastikan kartu digambar ulang saat status heads-up berubah.
+                      XposedBridge.hookAllMethods(sRowClass, "setPinned", INVALIDATE_HOOK);
+                      XposedBridge.hookAllMethods(sRowClass, "setHeadsUpAnimatingAway", INVALIDATE_HOOK);
+                      Class<?> trRow = XposedHelpers.findClassIfExists(ROW_PKG + "TrExpandableNotificationRow", cl);
+                      if (trRow != null) {
+                          XposedBridge.hookAllMethods(trRow, "setPinned", INVALIDATE_HOOK);
+                          XposedBridge.hookAllMethods(trRow, "setHeadsUpAnimatingAway", INVALIDATE_HOOK);
+                      }
+
+                      XposedBridge.log("[HunBlur] aktif, onDraw di-hook pada " + drawTarget.getName());
+                  } catch (Throwable t) {
+                      XposedBridge.log("[HunBlur] gagal memasang hook:");
+                      XposedBridge.log(t);
+                  }
+              }
+
+              private static boolean hasDeclaredOnDraw(Class<?> c) {
+                  try {
+                      c.getDeclaredMethod("onDraw", Canvas.class);
+                      return true;
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              private static final XC_MethodHook DRAW_HOOK = new XC_MethodHook() {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam param) {
+                      try {
+                          onBeforeDraw((View) param.thisObject, (Canvas) param.args[0]);
+                      } catch (Throwable t) {
+                          logOnce(t);
+                      }
+                  }
+              };
+
+              private static final XC_MethodHook INVALIDATE_HOOK = new XC_MethodHook() {
+                  @Override
+                  protected void afterHookedMethod(MethodHookParam param) {
+                      try {
+                          if (param.thisObject instanceof ViewGroup) {
+                              ViewGroup row = (ViewGroup) param.thisObject;
+                              int n = row.getChildCount();
+                              for (int i = 0; i < n; i++) {
+                                  View child = row.getChildAt(i);
+                                  if (sBgBaseClass.isInstance(child)) {
+                                      child.invalidate();
+                                  }
+                              }
+                          }
+                      } catch (Throwable t) {
+                          logOnce(t);
+                      }
+                  }
+              };
+
+              private static void onBeforeDraw(View v, Canvas canvas) throws Throwable {
+                  Drawable bg = (Drawable) field("mBackground").get(v);
+                  if (bg == null) {
+                      return;
+                  }
+
+                  boolean modified = XposedHelpers.getAdditionalInstanceField(v, K_MOD) != null;
+                  boolean hun = isHeadsUpCard(v) && canvas.isHardwareAccelerated() && blurEnabled();
+
+                  if (!hun) {
+                      if (modified) {
+                          // Kartu bukan heads-up lagi: kembalikan opasitas asli.
+                          bg.setAlpha(field("mDrawableAlpha").getInt(v));
+                          XposedHelpers.removeAdditionalInstanceField(v, K_MOD);
+                      }
+                      return;
+                  }
+
+                  int w = field("mActualWidth").getInt(v);
+                  int h = field("mActualHeight").getInt(v);
+                  int top = field("mClipTopAmount").getInt(v);
+                  int bottom = h - field("mClipBottomAmount").getInt(v);
+                  if (w <= 0 || bottom <= top) {
+                      return;
+                  }
+
+                  Drawable blur = obtainBlur(v);
+                  if (blur == null) {
+                      return;
+                  }
+                  blur.setBounds(0, top, w, bottom);
+                  applyCorners(blur, v);
+                  blur.draw(canvas);
+
+                  // Baru setelah blur berhasil digambar, latar kartu dibuat semi-transparan.
+                  bg.setAlpha(CARD_ALPHA);
+                  if (!modified) {
+                      XposedHelpers.setAdditionalInstanceField(v, K_MOD, Boolean.TRUE);
+                  }
+              }
+
+              /** True bila view latar ini milik baris notifikasi yang sedang tampil sebagai heads-up. */
+              private static boolean isHeadsUpCard(View v) throws Throwable {
+                  ViewParent p = v.getParent();
+                  for (int i = 0; i < 3 && p != null; i++) {
+                      if (sRowClass.isInstance(p)) {
+                          if (field(sRowClass, "mIsPinned").getBoolean(p)) {
+                              return true;
+                          }
+                          Object away = XposedHelpers.callMethod(p, "isHeadsUpAnimatingAway");
+                          return away instanceof Boolean && (Boolean) away;
+                      }
+                      p = p.getParent();
+                  }
+                  return false;
+              }
+
+              private static Drawable obtainBlur(View v) {
+                  Object root = XposedHelpers.callMethod(v, "getViewRootImpl");
+                  if (root == null) {
+                      return null;
+                  }
+                  Drawable d = (Drawable) XposedHelpers.getAdditionalInstanceField(v, K_BLUR);
+                  Object cachedRoot = XposedHelpers.getAdditionalInstanceField(v, K_ROOT);
+                  if (d == null || cachedRoot != root) {
+                      d = (Drawable) XposedHelpers.callMethod(root, "createBackgroundBlurDrawable");
+                      if (d == null) {
+                          return null;
+                      }
+                      XposedHelpers.callMethod(d, "setBlurRadius", BLUR_RADIUS);
+                      XposedHelpers.setAdditionalInstanceField(v, K_BLUR, d);
+                      XposedHelpers.setAdditionalInstanceField(v, K_ROOT, root);
+                  }
+                  return d;
+              }
+
+              private static void applyCorners(Drawable blur, View v) {
+                  float tl;
+                  float tr;
+                  float br;
+                  float bl;
+                  try {
+                      float[] r = (float[]) field("mCornerRadii").get(v);
+                      tl = r[0];
+                      tr = r[2];
+                      br = r[4];
+                      bl = r[6];
+                      if (tl + tr + br + bl <= 0f) {
+                          throw new IllegalStateException("radius kosong");
+                      }
+                  } catch (Throwable t) {
+                      float d = v.getResources().getDisplayMetrics().density * FALLBACK_RADIUS_DP;
+                      tl = d;
+                      tr = d;
+                      br = d;
+                      bl = d;
+                  }
+                  try {
+                      // Urutan parameter: kiri-atas, kanan-atas, kiri-bawah, kanan-bawah.
+                      XposedHelpers.callMethod(blur, "setCornerRadius",
+                              Float.valueOf(tl), Float.valueOf(tr), Float.valueOf(bl), Float.valueOf(br));
+                  } catch (Throwable t) {
+                      XposedHelpers.callMethod(blur, "setCornerRadius", Float.valueOf(tl));
+                  }
+              }
+
+              /** Blur jendela bisa mati (mis. hemat baterai); bila mati, kartu dibiarkan seperti aslinya. */
+              private static boolean blurEnabled() {
+                  if (!sBlurApiResolved) {
+                      sBlurApiResolved = true;
+                      try {
+                          Class<?> c = Class.forName("android.view.CrossWindowBlurListeners");
+                          sBlurListeners = c.getMethod("getInstance").invoke(null);
+                          sIsBlurEnabled = c.getMethod("isCrossWindowBlurEnabled");
+                      } catch (Throwable ignored) {
+                          sIsBlurEnabled = null;
+                      }
+                  }
+                  if (sIsBlurEnabled == null) {
+                      return true;
+                  }
+                  try {
+                      return (Boolean) sIsBlurEnabled.invoke(sBlurListeners);
+                  } catch (Throwable t) {
+                      return true;
+                  }
+              }
+
+              private static Field field(String name) {
+                  return field(sBgBaseClass, name);
+              }
+
+              private static Field field(Class<?> c, String name) {
+                  String key = c.getName() + "#" + name;
+                  Field f = FIELDS.get(key);
+                  if (f == null) {
+                      f = XposedHelpers.findField(c, name);
+                      FIELDS.put(key, f);
+                  }
+                  return f;
+              }
+
+              private static void logOnce(Throwable t) {
+                  if (!sLoggedError) {
+                      sLoggedError = true;
+                      XposedBridge.log("[HunBlur] error saat menggambar:");
+                      XposedBridge.log(t);
+                  }
+              }
+          }
+          __HUN_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/arrays.xml <<'__HUN_EOF__'
+          <resources>
+              <string-array name="xposedscope">
+                  <item>com.android.systemui</item>
+              </string-array>
+          </resources>
+          __HUN_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'__HUN_EOF__'
+          <resources>
+              <string name="app_name">HiOS HUN Blur</string>
+          </resources>
+          __HUN_EOF__
+          cat > build.gradle <<'__HUN_EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __HUN_EOF__
+          cat > gradle.properties <<'__HUN_EOF__'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          __HUN_EOF__
+          cat > settings.gradle <<'__HUN_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "HiOSHunBlur"
+          include ':app', ':xposed-api'
+          __HUN_EOF__
+          mkdir -p xposed-api
+          cat > xposed-api/build.gradle <<'__HUN_EOF__'
+          plugins {
+              id 'java-library'
+          }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          __HUN_EOF__
+          mkdir -p xposed-api/src/main/java/de/robv/android/xposed
+          cat > xposed-api/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java <<'__HUN_EOF__'
+          package de.robv.android.xposed;
+
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /** Stub API (hanya untuk kompilasi). Implementasi asli disediakan LSPosed. */
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          __HUN_EOF__
+          mkdir -p xposed-api/src/main/java/de/robv/android/xposed
+          cat > xposed-api/src/main/java/de/robv/android/xposed/XC_MethodHook.java <<'__HUN_EOF__'
+          package de.robv.android.xposed;
+
+          import java.lang.reflect.Member;
+
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() {
+              }
+
+              public XC_MethodHook(int priority) {
+              }
+
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+              }
+
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+              }
+
+              public static class MethodHookParam {
+                  public Member method;
+                  public Object thisObject;
+                  public Object[] args;
+
+                  public Object getResult() {
+                      throw new UnsupportedOperationException("stub");
+                  }
+
+                  public void setResult(Object result) {
+                      throw new UnsupportedOperationException("stub");
+                  }
+
+                  public Throwable getThrowable() {
+                      throw new UnsupportedOperationException("stub");
+                  }
+              }
+
+              public class Unhook {
+              }
+          }
+          __HUN_EOF__
+          mkdir -p xposed-api/src/main/java/de/robv/android/xposed
+          cat > xposed-api/src/main/java/de/robv/android/xposed/XposedBridge.java <<'__HUN_EOF__'
+          package de.robv.android.xposed;
+
+          import java.util.Set;
+
+          public final class XposedBridge {
+              private XposedBridge() {
+              }
+
+              public static void log(String text) {
+                  throw new UnsupportedOperationException("stub");
+              }
+
+              public static void log(Throwable t) {
+                  throw 
